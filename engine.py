@@ -9,9 +9,9 @@ from typing import Iterable
 
 import torch
 
-import util.misc as utils
-from datasets.coco_eval import CocoEvaluator
-from datasets.panoptic_eval import PanopticEvaluator
+import detr.util.misc as utils
+from detr.datasets.coco_eval import CocoEvaluator
+from detr.datasets.panoptic_eval import PanopticEvaluator
 
 
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
@@ -87,6 +87,7 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
 
     for samples, targets in metric_logger.log_every(data_loader, 10, header):
         samples = samples.to(device)
+        print(targets)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
         outputs = model(samples)
