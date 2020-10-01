@@ -11,7 +11,7 @@ import torch.utils.data
 import torchvision
 from pycocotools import mask as coco_mask
 
-import detr.datasets.transforms as T
+from detr.datasets import transforms as T
 
 
 class CocoDetection(torchvision.datasets.CocoDetection):
