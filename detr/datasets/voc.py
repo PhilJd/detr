@@ -19,8 +19,7 @@ class VOCDetection(torchvision.datasets.VOCDetection):
         # if image_set == "trainval" and not coco_file.is_file():
         #     self._create_trainval_json(root, year)
         self.coco = COCO(coco_file)
-        with open(coco_file, 'r') as f:
-            val = json.load(f)
+        print("COCO:", self.coco)
         self.name_to_classid = {
             'aeroplane': 1,    'cat': 8,           'person': 15,
             'bicycle': 2,      'chair': 9,         'pottedplant': 16,
@@ -30,6 +29,9 @@ class VOCDetection(torchvision.datasets.VOCDetection):
             'bus': 6,          'horse': 13,        'tvmonitor': 20,
             'car': 7,          'motorbike': 14,
         }
+        with open(coco_file, 'r') as f:
+            coco_labels = json.load(f)
+            self.filename_to_id = {l["file_name"]: l["id"] for l in coco_labels['images']}
 
 
     # def _create_trainval_json(self, root, year):
@@ -55,12 +57,10 @@ class VOCDetection(torchvision.datasets.VOCDetection):
 
     def _prepare(self, image, target):
         w, h = image.size
-        #image_id = target["image_id"]
-        #image_id = torch.tensor([image_id])
+        image_id = self.filename_to_id[target["annotation"]["filename"]]
+        image_id = torch.tensor([image_id])
 
         annotation = target["annotation"]["object"]
-        #anno = [obj for obj in anno if 'iscrowd' not in obj or obj['iscrowd'] == 0]
-
         boxes = [obj["bndbox"] for obj in annotation]
         boxes = [[int(b["xmin"]), int(b["ymin"]), int(b["xmax"]), int(b["ymax"])] for b in boxes]
         # Boxes are in topleft bottom right format.
@@ -80,7 +80,7 @@ class VOCDetection(torchvision.datasets.VOCDetection):
         target = {}
         target["boxes"] = boxes
         target["labels"] = classes
-        #target["image_id"] = image_id
+        target["image_id"] = image_id
 
         # for conversion to coco api
         iscrowd = torch.tensor([obj["iscrowd"] if "iscrowd" in obj else 0 for obj in annotation])

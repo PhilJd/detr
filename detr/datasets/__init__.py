@@ -3,7 +3,7 @@ import torch.utils.data
 import torchvision
 
 from .coco import build as build_coco
-from .voc import build as build_voc
+from .voc import build as build_voc, VOCDetection
 
 
 def get_coco_api_from_dataset(dataset):
@@ -12,7 +12,7 @@ def get_coco_api_from_dataset(dataset):
         #     break
         if isinstance(dataset, torch.utils.data.Subset):
             dataset = dataset.dataset
-    if isinstance(dataset, torchvision.datasets.CocoDetection):
+    if isinstance(dataset, (torchvision.datasets.CocoDetection, VOCDetection)):
         return dataset.coco
 
 
