@@ -66,7 +66,6 @@ class VOCDetection(torchvision.datasets.VOCDetection):
         # Boxes are in topleft bottom right format.
         # guard against no boxes via resizing
         boxes = torch.as_tensor(boxes, dtype=torch.float32).reshape(-1, 4)
-        boxes[:, 2:] += boxes[:, :2]
         boxes[:, 0::2].clamp_(min=0, max=w)
         boxes[:, 1::2].clamp_(min=0, max=h)
 
