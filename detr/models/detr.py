@@ -2,6 +2,8 @@
 """
 DETR model and criterion classes.
 """
+import random
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -40,6 +42,7 @@ class DETR(nn.Module):
         self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
+        self.bootstrap_enabled = False
 
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
@@ -59,11 +62,18 @@ class DETR(nn.Module):
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
-
+        pos = pos[-1]
         src, mask = features[-1].decompose()
         assert mask is not None
-        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos[-1])[0]
 
+        if self.bootstrap_enabled and self.training:
+            x_i, y_i = random.choices([0, 1], k=2)
+            src = src[:, :, y_i::2, x_i::2]
+            mask = mask[:, y_i::2, x_i::2]
+            pos = pos[:, :, y_i::2, x_i::2]
+        
+        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos)[0]
+        #hs = hs[:, :, :self.num_queries]
         outputs_class = self.class_embed(hs)
         outputs_coord = self.bbox_embed(hs).sigmoid()
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
@@ -71,7 +81,7 @@ class DETR(nn.Module):
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
         return out
 
-    @torch.jit.unused
+    @torch.jit.unused 
     def _set_aux_loss(self, outputs_class, outputs_coord):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
@@ -114,6 +124,13 @@ class SetCriterion(nn.Module):
 
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+
+        # Set target class to background if iou < 0.2
+        #src_boxes = outputs['pred_boxes'][idx]
+        #target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        #iou = box_ops.pairwise_box_iou(src_boxes, target_boxes)[0]
+        #target_classes_o[iou < 0.2] = self.num_classes
+
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o

@@ -36,6 +36,22 @@ def box_iou(boxes1, boxes2):
     iou = inter / union
     return iou, union
 
+def pairwise_box_iou(boxes1, boxes2):
+    assert boxes1.shape == boxes2.shape, f"Boxes tensors must have the same shape but are {boxes1.shape} and {boxes2.shape}"
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.max(boxes1[:, :2], boxes2[:, :2])  # [N,2]
+    rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])  # [N,2]
+
+    wh = (rb - lt).clamp(min=0)  # [N ,2]
+    intersection = wh[:, 0] * wh[:, 1]  # [N]
+
+    union = area1 + area2 - intersection
+
+    iou = intersection / union
+    return iou, union
+
 
 def generalized_box_iou(boxes1, boxes2):
     """

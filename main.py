@@ -38,6 +38,7 @@ def get_args_parser():
                         help="If true, we replace stride with dilation in the last convolutional block (DC5)")
     parser.add_argument('--position_embedding', default='sine', type=str, choices=('sine', 'learned'),
                         help="Type of positional embedding to use on top of the image features")
+    parser.add_argument('--num_bootstrap_epochs', default=10, type=int)
 
     # * Transformer
     parser.add_argument('--enc_layers', default=6, type=int,
@@ -77,9 +78,12 @@ def get_args_parser():
     parser.add_argument('--giou_loss_coef', default=2, type=float)
     parser.add_argument('--eos_coef', default=0.1, type=float,
                         help="Relative classification weight of the no-object class")
+    # Batch training
+    parser.add_argument('--accumulate_batches', default=1, type=int,
+                        help="Number of batches used to accumulate gradients.")
 
     # dataset parameters
-    parser.add_argument('--dataset_file', default='coco')
+    parser.add_argument('--dataset_file', default='voc')
     parser.add_argument('--data_path', type=str)
     parser.add_argument('--coco_panoptic_path', type=str)
     parser.add_argument('--remove_difficult', action='store_true')
@@ -194,9 +198,11 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             sampler_train.set_epoch(epoch)
+        # Enable/Disable stride on backbone features for initial epochs.
+        model.bootstrap_enabled = epoch <= args.num_bootstrap_epochs
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
-            args.clip_max_norm)
+            args.clip_max_norm, accumulate_batches=args.accumulate_batches)
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
@@ -230,7 +236,7 @@ def main(args):
                 (output_dir / 'eval').mkdir(exist_ok=True)
                 if "bbox" in coco_evaluator.coco_eval:
                     filenames = ['latest.pth']
-                    if epoch % 50 == 0:
+                    if epoch % 10 == 0:
                         filenames.append(f'{epoch:03}.pth')
                     for name in filenames:
                         torch.save(coco_evaluator.coco_eval["bbox"].eval,

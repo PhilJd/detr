@@ -13,9 +13,15 @@ from typing import Optional, List
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
+#from detr.models.attention import MultiheadAttention
 
 #import giraffe.models.attention as giraffe_attention
 
+class PermuteBatchNorm1d(nn.BatchNorm1d):
+
+    def forward(self, x):
+        x = x.permute(1, 2, 0)
+        return super().forward(x).permute(2, 0, 1)
 
 class Transformer(nn.Module):
 
@@ -28,11 +34,13 @@ class Transformer(nn.Module):
         encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
         encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
+        # encoder_norm = PermuteBatchNorm1d(d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
         decoder_norm = nn.LayerNorm(d_model)
+        # decoder_norm = PermuteBatchNorm1d(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
                                           return_intermediate=return_intermediate_dec)
 
@@ -51,18 +59,23 @@ class Transformer(nn.Module):
         bs, c, h, w = src.shape
         src = src.flatten(2).permute(2, 0, 1)
         pos_embed = pos_embed.flatten(2).permute(2, 0, 1)
+        #num_queries = query_embed.shape[0]
         query_embed = query_embed.unsqueeze(1).repeat(1, bs, 1)
         mask = mask.flatten(1)
+        #src = torch.cat([query_embed, src], dim=0)
+        #pos_embed = torch.cat([torch.zeros_like(query_embed), pos_embed], dim=0)
+        #mask = torch.cat([torch.zeros([bs, num_queries], dtype=mask.dtype, device=mask.device), mask], dim=1)
 
-        tgt = torch.zeros_like(query_embed)
         #with torch.autograd.profiler.record_function("encoder"):
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
-        #return [memory.permute(1, 0, 2)]
+        #print(memory.permute(1, 0, 2).shape)
+        #return [memory.transpose(1, 2), None]
 
         #with torch.autograd.profiler.record_function("decoder"):
+        tgt = torch.zeros_like(query_embed)
         hs = self.decoder(tgt, memory, memory_key_padding_mask=mask,
                           pos=pos_embed, query_pos=query_embed)
-        #print("hs.shape, memory.shape", hs.shape, memory.shape)
+        #print("hs.shape, memory.shape, memory", hs.transpose(1, 2).shape, memory.permute(1, 2, 0).view(bs, c, h, w).shape, memory.shape)
         return hs.transpose(1, 2), memory.permute(1, 2, 0).view(bs, c, h, w)
 
 
@@ -79,14 +92,15 @@ class TransformerEncoder(nn.Module):
                 src_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None):
         output = src
-
+        intermediate = []
         for layer in self.layers:
             output = layer(output, src_mask=mask,
                            src_key_padding_mask=src_key_padding_mask, pos=pos)
+            #intermediate.append(output)
 
         if self.norm is not None:
             output = self.norm(output)
-
+        #return torch.stack(intermediate)
         return output
 
 
@@ -144,7 +158,9 @@ class TransformerEncoderLayer(nn.Module):
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
         self.norm1 = nn.LayerNorm(d_model)
+        # self.norm1 = PermuteBatchNorm1d(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+        # self.norm2 = PermuteBatchNorm1d(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
@@ -193,17 +209,33 @@ class TransformerEncoderLayer(nn.Module):
     #         return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
     #     return self.forward_post(src, src_mask, src_key_padding_mask, pos)
 
+    # def forward(self, src,
+    #            src_mask: Optional[Tensor] = None,
+    #            src_key_padding_mask: Optional[Tensor] = None,
+    #            pos: Optional[Tensor] = None):
+    #    q = k = self.with_pos_embed(src, pos)
+    #    attention_out = self.self_attn(q, k, value=src, attn_mask=src_mask,
+    #                                   key_padding_mask=src_key_padding_mask)[0]
+    #    src = src + self.dropout1(attention_out * self.residual_weight)
+    #    dense_out = self.linear2(self.dropout(self.activation(self.linear1(src))))
+    #    src = src + self.dropout2(dense_out * self.residual_weight)
+    #    return src
+
     def forward(self, src,
-               src_mask: Optional[Tensor] = None,
-               src_key_padding_mask: Optional[Tensor] = None,
-               pos: Optional[Tensor] = None):
-       q = k = self.with_pos_embed(src, pos)
-       attention_out = self.self_attn(q, k, value=src, attn_mask=src_mask,
-                                      key_padding_mask=src_key_padding_mask)[0]
-       src = src + self.dropout1(attention_out * self.residual_weight)
-       dense_out = self.linear2(self.dropout(self.activation(self.linear1(src))))
-       src = src + self.dropout2(dense_out * self.residual_weight)
-       return src
+                    src_mask: Optional[Tensor] = None,
+                    src_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None):
+        """Forward pre with rezero."""
+        src2 = self.norm1(src)
+        q = k = self.with_pos_embed(src2, pos)
+        src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask,
+                              key_padding_mask=src_key_padding_mask)[0]
+        src = src + self.dropout1(src2 * self.residual_weight)
+        src2 = self.norm2(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
+        src = src + self.dropout2(src2 * self.residual_weight)
+        return src
+
 
 
 
@@ -222,8 +254,11 @@ class TransformerDecoderLayer(nn.Module):
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
         self.norm1 = nn.LayerNorm(d_model)
+        # self.norm1 = PermuteBatchNorm1d(d_model)
         self.norm2 = nn.LayerNorm(d_model)
+        # self.norm2 = PermuteBatchNorm1d(d_model)
         self.norm3 = nn.LayerNorm(d_model)
+        # self.norm3 = PermuteBatchNorm1d(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
@@ -295,25 +330,49 @@ class TransformerDecoderLayer(nn.Module):
     #     return self.forward_post(tgt, memory, tgt_mask, memory_mask,
     #                              tgt_key_padding_mask, memory_key_padding_mask, pos, query_pos)
 
+    # def forward(self, tgt, memory,
+    #            tgt_mask: Optional[Tensor] = None,
+    #            memory_mask: Optional[Tensor] = None,
+    #            tgt_key_padding_mask: Optional[Tensor] = None,
+    #            memory_key_padding_mask: Optional[Tensor] = None,
+    #            pos: Optional[Tensor] = None,
+    #            query_pos: Optional[Tensor] = None):
+    #    q = k = self.with_pos_embed(tgt, query_pos)
+    #    tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
+    #                          key_padding_mask=tgt_key_padding_mask)[0]
+    #    tgt = tgt + self.dropout1(tgt2) * self.residual_weight
+    #    tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
+    #                               key=self.with_pos_embed(memory, pos),
+    #                               value=memory, attn_mask=memory_mask,
+    #                               key_padding_mask=memory_key_padding_mask)[0]
+    #    tgt = tgt + self.dropout2(tgt2) * self.residual_weight
+    #    tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+    #    tgt = tgt + self.dropout3(tgt2) * self.residual_weight
+    #    return tgt
+
     def forward(self, tgt, memory,
-               tgt_mask: Optional[Tensor] = None,
-               memory_mask: Optional[Tensor] = None,
-               tgt_key_padding_mask: Optional[Tensor] = None,
-               memory_key_padding_mask: Optional[Tensor] = None,
-               pos: Optional[Tensor] = None,
-               query_pos: Optional[Tensor] = None):
-       q = k = self.with_pos_embed(tgt, query_pos)
-       tgt2 = self.self_attn(q, k, value=tgt, attn_mask=tgt_mask,
-                             key_padding_mask=tgt_key_padding_mask)[0]
-       tgt = tgt + self.dropout1(tgt2) * self.residual_weight
-       tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
-                                  key=self.with_pos_embed(memory, pos),
-                                  value=memory, attn_mask=memory_mask,
-                                  key_padding_mask=memory_key_padding_mask)[0]
-       tgt = tgt + self.dropout2(tgt2) * self.residual_weight
-       tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
-       tgt = tgt + self.dropout3(tgt2) * self.residual_weight
-       return tgt
+                    tgt_mask: Optional[Tensor] = None,
+                    memory_mask: Optional[Tensor] = None,
+                    tgt_key_padding_mask: Optional[Tensor] = None,
+                    memory_key_padding_mask: Optional[Tensor] = None,
+                    pos: Optional[Tensor] = None,
+                    query_pos: Optional[Tensor] = None):
+        """Forward Pre with rezero."""
+        tgt2 = self.norm1(tgt)
+        q = k = self.with_pos_embed(tgt2, query_pos)
+        tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
+                              key_padding_mask=tgt_key_padding_mask)[0]
+        tgt = tgt + self.dropout1(tgt2) * self.residual_weight
+        tgt2 = self.norm2(tgt)
+        tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
+                                   key=self.with_pos_embed(memory, pos),
+                                   value=memory, attn_mask=memory_mask,
+                                   key_padding_mask=memory_key_padding_mask)[0]
+        tgt = tgt + self.dropout2(tgt2) * self.residual_weight
+        tgt2 = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
+        tgt = tgt + self.dropout3(tgt2) * self.residual_weight
+        return tgt
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
