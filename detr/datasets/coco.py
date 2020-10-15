@@ -129,8 +129,8 @@ def make_coco_transforms(image_set):
             T.RandomSelect(
                 T.RandomResize(scales, max_size=640),  # Originally: 1333.
                 T.Compose([
-                    T.RandomResize([200, 250, 650]),   # Originally: [400, 500, 600].
-                    T.RandomSizeCrop(192, 300),  # Originally: 384, 600.
+                    T.RandomResize([400, 500, 600]),   # Originally: [400, 500, 600].
+                    T.RandomSizeCrop(384, 600),  # Originally: 384, 600.
                     T.RandomResize(scales, max_size=640),   # Originally: 1333.
                 ])
             ),
@@ -139,7 +139,7 @@ def make_coco_transforms(image_set):
 
     if image_set == 'val':
         return T.Compose([
-            T.RandomResize([480], max_size=640),  # Originally: [800], 1333.
+            T.RandomResize([640], max_size=640),  # Originally: [800], 1333.
             normalize,
         ])
 
