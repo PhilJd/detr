@@ -1,25 +1,26 @@
 """Pascal VOC 2007 and 2012 dataset."""
 import json
+from copy import deepcopy
+from io import BytesIO
+from pathlib import Path
 
 import torch
 import torchvision
 from detr.datasets import coco
-from pathlib import Path
+from PIL import Image
 from pycocotools.coco import COCO
+
 
 
 class VOCDetection(torchvision.datasets.VOCDetection):
 
-    def __init__(self, root, year, image_set, transforms):
-        print("root:", root)
+    def __init__(self, root, year, image_set, transforms, in_memory=True):
         super().__init__(root, year, image_set)
+        self.in_memory = in_memory
         self._transforms = transforms
         coco_file = (root / "VOCdevkit" / "external_PASCAL_VOC_coco_format" / 
                      "PASCAL_VOC" / f"pascal_{image_set}{year}.json")
-        # if image_set == "trainval" and not coco_file.is_file():
-        #     self._create_trainval_json(root, year)
         self.coco = COCO(coco_file)
-        print("COCO:", self.coco)
         self.name_to_classid = {
             'aeroplane': 1,    'cat': 8,           'person': 15,
             'bicycle': 2,      'chair': 9,         'pottedplant': 16,
@@ -32,28 +33,26 @@ class VOCDetection(torchvision.datasets.VOCDetection):
         with open(coco_file, 'r') as f:
             coco_labels = json.load(f)
             self.filename_to_id = {l["file_name"]: l["id"] for l in coco_labels['images']}
-
-
-    # def _create_trainval_json(self, root, year):
-    #     """COCO only provides separate train and val files, so we combine them."""
-    #     base_path = root / "VOCdevkit" / "external_PASCAL_VOC_coco_format" / "PASCAL_VOC"
-    #     coco_val = base_path / f"pascal_val{year}.json"
-    #     coco_train = base_path / f"pascal_train{year}.json"
-    #     with open(coco_val, 'r') as f:
-    #         val = json.load(f)
-    #     with open(coco_train, 'r') as f:
-    #         train = json.load(f)
-    #     train['images'].append(val['images'])
-    #     train['annotations'].append(val['annotations'])
-    #     with open(base_path / f"pascal_trainval{year}.json", 'w') as f:
-    #         json.dump(train, f, sort_keys=True)
+        self.cache = [None] * len(self.filename_to_id)
 
     def __getitem__(self, idx):
-        img, target = super().__getitem__(idx)
+        if not self.in_memory:
+            img, target = super().__getitem__(idx)
+        else:
+            cached = self.cache[idx]
+            if cached is None:
+                img, target = super().__getitem__(idx)
+                buffer = BytesIO()
+                img.save(buffer, "JPEG")
+                self.cache[idx] = (buffer, deepcopy(target))
+            else:
+                img, target = cached
+                img = Image.open(img)
+
         img, target = self._prepare(img, target)
         if self._transforms is not None:
             img, target = self._transforms(img, target)
-        return img, target
+        return img, target  
 
     def _prepare(self, image, target):
         w, h = image.size
@@ -97,15 +96,6 @@ def build(image_set, args):
     root = Path(args.data_path)
     # TODO: trainval and test?
     assert root.exists(), f'provided VOC path {root} does not exist'
-    mode = 'instances'
-    PATHS = {
-        "train2007": (root /  "train2017", root / "annotations" / f'{mode}_train2017.json'),
-        "train2012": (root / "train2017", root / "annotations" / f'{mode}_train2017.json'),
-        "val": (root / "val2017", root / "annotations" / f'{mode}_val2017.json'),
-    }
-
-    
-    #if args.year=20072012 and image_set == "train":
     transforms = transforms=coco.make_coco_transforms(image_set)
     if image_set == "train":
         dataset =  torch.utils.data.ConcatDataset([
