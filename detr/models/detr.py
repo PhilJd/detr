@@ -3,6 +3,8 @@
 DETR model and criterion classes.
 """
 import random
+from math import sqrt
+from collections import OrderedDict
 
 import torch
 import torch.nn.functional as F
@@ -20,9 +22,106 @@ from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
 from .transformer import build_transformer
 
 
+
+
+
+class MultiTensorScaling(torch.autograd.Function):
+    """
+    We can implement our own custom autograd Functions by subclassing
+    torch.autograd.Function and implementing the forward and backward passes
+    which operate on Tensors.
+    """
+    @staticmethod
+    def forward(ctx, scale, *param_list):
+        """
+        In the forward pass we receive a Tensor containing the input and return
+        a Tensor containing the output. ctx is a context object that can be used
+        to stash information for backward computation. You can cache arbitrary
+        objects for use in the backward pass using the ctx.save_for_backward method.
+        """
+        ctx.save_for_backward(*param_list, scale.detach())
+        return torch._foreach_mul(param_list, float(scale))
+
+    @staticmethod
+    def backward(ctx, *grad_output):
+        """
+        In the backward pass we receive a Tensor containing the gradient of the loss
+        with respect to the output, and we need to compute the gradient of the loss
+        with respect to the input.
+        """
+        *param_list, scale = ctx.saved_tensors
+        dscale_dL = sum(grad.sum() for grad in torch._foreach_mul(param_list, grad_output))
+        dparam_dL = torch._foreach_mul(grad_output, float(scale))
+        return (dscale_dL,) + dparam_dL
+
+
+multitensor_scaling = MultiTensorScaling.apply
+
+x = [torch.randn([1], dtype=torch.float64).view([]), torch.randn(3, 3, dtype=torch.float64),
+     torch.randn(4, 5, dtype=torch.float64), torch.randn(3, 3, dtype=torch.float64)]
+for p in x:
+    p.requires_grad = True
+#torch.autograd.gradcheck(lambda scale, a, b, c: sum(p.sum() for p in multitensor_scaling(scale, a, b, c)), x)
+torch.autograd.gradcheck(multitensor_scaling, x)
+#exit()
+
+def assign_scaled_parameter(module, scaled_param_dict, prefix=""):
+    module._parameters_backup = module._parameters
+    module._buffers_backup = module._buffers
+    module._parameters = {}
+    module._buffers = {}
+    if prefix:
+        prefix = prefix + "."
+    # Set the weight to the scaled value if present, otherwise use the
+    # original value.
+    for name, parameter in module._parameters_backup.items():
+        key = f"{prefix}{name}"
+        module.__setattr__(name, scaled_param_dict.get(key, parameter))
+    for name, buffer in module._buffers_backup.items():
+        key = f"{prefix}{name}"
+        module.__setattr__(name, scaled_param_dict.get(key, buffer))
+    for name, submodule in module._modules.items():
+        assign_scaled_parameter(submodule, scaled_param_dict, prefix=f"{prefix}{name}")
+
+
+
+# def scale_parameter_member(module, scale, mean=None):
+#     module._parameters_backup = module._parameters
+#     module._buffers_backup = module._buffers
+#     module._parameters = {}
+#     module._buffers = {}
+#     for name, parameter in module._parameters_backup.items():
+#         if parameter is None or "global_scale" in name:
+#             value = parameter
+#         elif mean is None:
+#             value = parameter * scale
+#         else:
+#             value = (parameter - mean) * scale
+#         module.__setattr__(name, value)
+#     for name, buffer in module._buffers_backup.items():
+#         if buffer is None or "global_scale" in name:
+#             value = buffer
+#         elif mean is None:
+#             value = buffer * scale
+#         else:
+#             value = (buffer - mean) * scale
+#         module.__setattr__(name, value)
+#     for name, submodule in module._modules.items():
+#         if "backbone" not in name:
+#             scale_parameter_member(submodule, scale, mean)
+
+def restore_params(module):
+    module._parameters = module._parameters_backup
+    module._buffers = module._buffers_backup
+    for name, submodule in module._modules.items():
+        restore_params(submodule)
+    #module._parameters_backup = None
+    #module._buffers_backup = None
+
+
 class DETR(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False):
+    def __init__(self, backbone, transformer, num_classes, num_queries, aux_loss=False, high_def=False):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -33,16 +132,26 @@ class DETR(nn.Module):
             aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
         """
         super().__init__()
+        self.high_def = high_def
         self.num_queries = num_queries
         self.transformer = transformer
         hidden_dim = transformer.d_model
         self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
         self.bbox_embed = MLP(hidden_dim, hidden_dim, 4, 3)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
-        self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
+        if self.high_def:
+            self.projections = torch.nn.ModuleList([nn.Conv2d(num_channels, hidden_dim, kernel_size=1) for num_channels in backbone.num_channels])
+        else:
+            self.input_proj = nn.Conv2d(backbone.num_channels, hidden_dim, kernel_size=1)
         self.backbone = backbone
         self.aux_loss = aux_loss
-        self.bootstrap_enabled = False
+        #self.bootstrap_steps = [10, 20]
+        self.bootstrap_steps = [10]
+        self.epoch = 0
+        self.stride = None
+        self.register_parameter("global_scale", nn.Parameter(torch.Tensor([0.022])))
+        # Scale only once.
+        self.scaled = False
 
     def forward(self, samples: NestedTensor):
         """ The forward expects a NestedTensor, which consists of:
@@ -59,26 +168,103 @@ class DETR(nn.Module):
                - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
                                 dictionnaries containing the two above keys for each decoder layer.
         """
+
+        # Global weight norm.
+        #params = [p for n, p in self.named_parameters() if ("backbone" not in n and "global_scale" not in n) and p.requires_grad]
+        #params = [p for p in self.parameters()]
+        #contiguous = torch.cat([p.view(-1) for p in params])
+        #mean = contiguous.mean()
+        #std = contiguous.std()
+        # Initial std: 0.0392
+        #print("\n\nstd", std, "\n\n")
+        #scale_parameter_member(self, 0.022 / std, mean)
+        #scale_parameter_member(self, 0.022 / std)
+        #scale_parameter_member(self, self.global_scale / std)
+        if not self.scaled:
+            self.scaled = True
+            ignore = ["backbone", "global_scale", "bbox_embed.layers.2", "query_embed.weight", "class_embed."]
+            named_params = [(n, p) for n, p in self.named_parameters() if all(i not in n for i in ignore) and p.requires_grad]
+            names, params = zip(*named_params)
+            contiguous = torch.cat([p.view(-1) for p in params])
+            std = contiguous.std()
+            with torch.no_grad():
+                for param in params:
+                    param.data.mul_(0.022 / std)
+        # scaled_params = multitensor_scaling((0.022 / std), *params)
+        
+        # # param_dict = dict(named_params)
+        # # scaled_params = []
+        # # for (n, p) in named_params:
+        # #     # Replace bias with weight for fan in computation.
+        # #     fanin_name = n
+        # #     if n.endswith("bias"):
+        # #         scaled_params.append(p)
+        # #         fanin_name = n[:-4] + "weight"
+        # #     fanin_shape = param_dict[fanin_name].shape
+        # #     fanin = fanin_shape.numel() / fanin_shape[0]
+        # #     scale = sqrt(1/fanin) / std
+        # #     print(fanin, float(std), sqrt(1/fanin), float(scale), float((p*scale).std()))
+        # #     scaled_params.append(p * scale)
+                
+        
+        # #scaled_params = multitensor_scaling((self.global_scale.squeeze() / std), *params)
+        # scaled_param_dict = dict(zip(names, scaled_params))
+        
+        # # a_names, attention_params = zip(*[(n, p) for n, p in named_params if "in_proj" in n])
+        # # rest_names, rest_params = zip(*[(n, p) for n, p in named_params if "in_proj" not in n])
+        
+        # # #a_scaled_params = multitensor_scaling(sqrt(0.022) / std.sqrt(), *attention_params)
+        # # a_scaled_params = multitensor_scaling((0.022 / std).sqrt(), *attention_params)
+        # # rest_scaled_params = multitensor_scaling(0.022 / std, *rest_params)
+        
+        # # scaled_param_dict = dict(zip(a_names, a_scaled_params))
+        # # scaled_param_dict.update(dict(zip(rest_names, rest_scaled_params)))
+        # assign_scaled_parameter(self, scaled_param_dict)
+
+       
+
         if isinstance(samples, (list, torch.Tensor)):
             samples = nested_tensor_from_tensor_list(samples)
         features, pos = self.backbone(samples)
-        pos = pos[-1]
-        src, mask = features[-1].decompose()
-        assert mask is not None
 
-        if self.bootstrap_enabled and self.training:
-            x_i, y_i = random.choices([0, 1], k=2)
-            src = src[:, :, y_i::2, x_i::2]
-            mask = mask[:, y_i::2, x_i::2]
-            pos = pos[:, :, y_i::2, x_i::2]
+        if self.high_def:
+            # Use the middle feature map as reference
+            reference = 1
+            pos = pos[reference]
+            src, mask = features[reference].decompose()
+            src = self.projections[reference](src)
+            for i,(projection, fmap) in enumerate(zip(self.projections, features)):
+                if i == reference:
+                    continue
+                fmap = projection(fmap.tensors)
+                src += torch.nn.functional.interpolate(fmap, src.shape[2:4],
+                                                       mode="bilinear", align_corners=True)
+        else:
+            pos = pos[-1]
+            src, mask = features[-1].decompose()
+            assert mask is not None
+            src = self.input_proj(src)
+
+        if self.bootstrap_steps and self.training:
+            stride = sum([self.epoch < e for e in self.bootstrap_steps]) + 1
+            self.stride = stride
+            if stride > 1:
+                x_i, y_i = random.choices(range(stride), k=2)
+                src = src[:, :, y_i::stride, x_i::stride]
+                mask = mask[:, y_i::stride, x_i::stride]
+                pos = pos[:, :, y_i::stride, x_i::stride]
         
-        hs = self.transformer(self.input_proj(src), mask, self.query_embed.weight, pos)[0]
+        hs = self.transformer(src, mask, self.query_embed.weight, pos)[0]
         #hs = hs[:, :, :self.num_queries]
         outputs_class = self.class_embed(hs)
-        outputs_coord = self.bbox_embed(hs).sigmoid()
+        #outputs_coord = self.bbox_embed(hs).sigmoid()
+        outputs_coord = self.bbox_embed(hs)
+        outputs_coord[..., 2:] = torch.exp(outputs_coord[..., 2:])
         out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1]}
         if self.aux_loss:
             out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord)
+
+        #restore_params(self)
         return out
 
     @torch.jit.unused 
@@ -237,7 +423,7 @@ class SetCriterion(nn.Module):
                       The expected keys in each dict depends on the losses applied, see each loss' doc
         """
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
-
+    
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
 
@@ -344,6 +530,7 @@ def build(args):
         num_classes=num_classes,
         num_queries=args.num_queries,
         aux_loss=args.aux_loss,
+        high_def=args.high_def
     )
     if args.masks:
         model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))

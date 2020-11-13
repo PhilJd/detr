@@ -63,9 +63,11 @@ class BackboneBase(nn.Module):
             if not train_backbone or 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
                 parameter.requires_grad_(False)
         if return_interm_layers:
-            return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
+            #return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
+            return_layers = {"layer2": "0", "layer3": "1", "layer4": "2"}
         else:
             return_layers = {'layer4': "0"}
+            #return_layers = {'layer3': "0"}
         self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
         self.num_channels = num_channels
 
@@ -89,7 +91,11 @@ class Backbone(BackboneBase):
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
             pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d)
-        num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
+        if return_interm_layers:
+            assert name is "resnet50", "Backbone supports return_interm_layers only for Resnet50"
+            num_channels = [512, 1024, 2048]
+        else:
+            num_channels = 512 if name in ('resnet18', 'resnet34') else 2048 #1024  
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 
 
@@ -112,7 +118,8 @@ class Joiner(nn.Sequential):
 def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = args.lr_backbone > 0
-    return_interm_layers = args.masks
+    #return_interm_layers = args.masks
+    return_interm_layers = args.high_def
     backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels

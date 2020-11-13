@@ -17,6 +17,10 @@ from torch import nn, Tensor
 
 #import giraffe.models.attention as giraffe_attention
 
+# NORM = PermuteBatchNorm1d
+# NORM = nn.LayerNorm
+NORM = nn.Identity
+
 class PermuteBatchNorm1d(nn.BatchNorm1d):
 
     def forward(self, x):
@@ -33,14 +37,12 @@ class Transformer(nn.Module):
 
         encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
-        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
-        # encoder_norm = PermuteBatchNorm1d(d_model) if normalize_before else None
+        encoder_norm = NORM(d_model) if normalize_before else None
         self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
         decoder_layer = TransformerDecoderLayer(d_model, nhead, dim_feedforward,
                                                 dropout, activation, normalize_before)
-        decoder_norm = nn.LayerNorm(d_model)
-        # decoder_norm = PermuteBatchNorm1d(d_model)
+        decoder_norm = NORM(d_model)
         self.decoder = TransformerDecoder(decoder_layer, num_decoder_layers, decoder_norm,
                                           return_intermediate=return_intermediate_dec)
 
@@ -142,7 +144,7 @@ class TransformerDecoder(nn.Module):
         if self.return_intermediate:
             return torch.stack(intermediate)
 
-        return output
+        return output.unsqueeze(0)
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -157,17 +159,16 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
-        self.norm1 = nn.LayerNorm(d_model)
-        # self.norm1 = PermuteBatchNorm1d(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        # self.norm2 = PermuteBatchNorm1d(d_model)
+        self.norm1 = NORM(d_model)
+        self.norm2 = NORM(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
 
-        self.residual_weight = nn.Parameter(torch.Tensor([0]))
+        #self.residual_weight = nn.Parameter(torch.Tensor([0]))
+        self.residual_weight = None
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
@@ -230,10 +231,16 @@ class TransformerEncoderLayer(nn.Module):
         q = k = self.with_pos_embed(src2, pos)
         src2 = self.self_attn(q, k, value=src2, attn_mask=src_mask,
                               key_padding_mask=src_key_padding_mask)[0]
-        src = src + self.dropout1(src2 * self.residual_weight)
+        if self.residual_weight is not None:
+            src = src + self.dropout1(src2 * self.residual_weight)
+        else:
+            src = src + self.dropout1(src2)
         src2 = self.norm2(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
-        src = src + self.dropout2(src2 * self.residual_weight)
+        if self.residual_weight is not None:
+            src = src + self.dropout2(src2 * self.residual_weight)
+        else:
+            src = src + self.dropout2(src2)
         return src
 
 
@@ -253,12 +260,9 @@ class TransformerDecoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
-        self.norm1 = nn.LayerNorm(d_model)
-        # self.norm1 = PermuteBatchNorm1d(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        # self.norm2 = PermuteBatchNorm1d(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        # self.norm3 = PermuteBatchNorm1d(d_model)
+        self.norm1 = NORM(d_model)
+        self.norm2 = NORM(d_model)
+        self.norm3 = NORM(d_model)
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
         self.dropout3 = nn.Dropout(dropout)
@@ -266,7 +270,8 @@ class TransformerDecoderLayer(nn.Module):
         self.activation = _get_activation_fn(activation)
         self.normalize_before = normalize_before
         
-        self.residual_weight = nn.Parameter(torch.Tensor([0]))
+        #self.residual_weight = nn.Parameter(torch.Tensor([0]))
+        self.residual_weight = None
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
         return tensor if pos is None else tensor + pos
@@ -362,16 +367,25 @@ class TransformerDecoderLayer(nn.Module):
         q = k = self.with_pos_embed(tgt2, query_pos)
         tgt2 = self.self_attn(q, k, value=tgt2, attn_mask=tgt_mask,
                               key_padding_mask=tgt_key_padding_mask)[0]
-        tgt = tgt + self.dropout1(tgt2) * self.residual_weight
+        if self.residual_weight is not None:
+            tgt = tgt + self.dropout1(tgt2) * self.residual_weight
+        else:
+            tgt = tgt + self.dropout1(tgt2)
         tgt2 = self.norm2(tgt)
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
                                    key=self.with_pos_embed(memory, pos),
                                    value=memory, attn_mask=memory_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
-        tgt = tgt + self.dropout2(tgt2) * self.residual_weight
+        if self.residual_weight is not None:
+            tgt = tgt + self.dropout2(tgt2) * self.residual_weight
+        else:
+            tgt = tgt + self.dropout2(tgt2)
         tgt2 = self.norm3(tgt)
         tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt2))))
-        tgt = tgt + self.dropout3(tgt2) * self.residual_weight
+        if self.residual_weight is not None:
+            tgt = tgt + self.dropout3(tgt2) * self.residual_weight
+        else:
+            tgt = tgt + self.dropout3(tgt2)
         return tgt
 
 def _get_clones(module, N):

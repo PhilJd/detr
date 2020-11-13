@@ -24,7 +24,7 @@ def get_args_parser():
     parser.add_argument('--batch_size', default=2, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=300, type=int)
-    parser.add_argument('--lr_drop', default=200, type=int)
+    parser.add_argument('--lr_drop', default=40, type=int)
     parser.add_argument('--clip_max_norm', default=0.1, type=float,
                         help='gradient clipping max norm')
 
@@ -40,7 +40,10 @@ def get_args_parser():
                         help="Type of positional embedding to use on top of the image features")
     parser.add_argument('--num_bootstrap_epochs', default=10, type=int)
 
-    # * Transformer
+    parser.add_argument('--high_def', action='store_true',
+                        help="If true, sum multiple fmaps from different spatial resolutions.")
+
+    # * rer
     parser.add_argument('--enc_layers', default=6, type=int,
                         help="Number of encoding layers in the transformer")
     parser.add_argument('--dec_layers', default=6, type=int,
@@ -133,9 +136,9 @@ def main(args):
     print('number of params:', n_parameters)
 
     param_dicts = [
-        {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and p.requires_grad]},
+        {"params": [p for n, p in model_without_ddp.named_parameters() if "backbone" not in n and "global_scale" not in n and p.requires_grad]},
         {
-            "params": [p for n, p in model_without_ddp.named_parameters() if "backbone" in n and p.requires_grad],
+            "params": [p for n, p in model_without_ddp.named_parameters() if ("backbone" in n or "global_scale" in n) and p.requires_grad],
             "lr": args.lr_backbone,
         },
     ]
@@ -184,6 +187,8 @@ def main(args):
         if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
             optimizer.load_state_dict(checkpoint['optimizer'])
             lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
+            # for group in lr_scheduler.optimizer.param_groups:
+            #     group['lr'] *= 10
             args.start_epoch = checkpoint['epoch'] + 1
 
     if args.eval:
@@ -199,10 +204,12 @@ def main(args):
         if args.distributed:
             sampler_train.set_epoch(epoch)
         # Enable/Disable stride on backbone features for initial epochs.
-        model.bootstrap_enabled = epoch <= args.num_bootstrap_epochs
+        #model.bootstrap_enabled = epoch <= args.num_bootstrap_epochs
+        model.epoch = epoch
         train_stats = train_one_epoch(
             model, criterion, data_loader_train, optimizer, device, epoch,
             args.clip_max_norm, accumulate_batches=args.accumulate_batches)
+        print(f"Backbone stride: {model.stride}")
         lr_scheduler.step()
         if args.output_dir:
             checkpoint_paths = [output_dir / 'checkpoint.pth']
